@@ -3,7 +3,7 @@
 # ============================================================
 library(shiny); library(shinydashboard); library(tidyquant)
 library(quantmod); library(dplyr); library(ggplot2)
-library(DT); library(quadprog); library(shinyjs)
+library(DT); library(quadprog); library(shinyjs); library(corpcor)
 
 DEFAULT_TICKERS <- c(
   # ── Technology ────────────────────────────────────────────────
@@ -176,7 +176,7 @@ compute_profile <- function(age, income, occupation, risk_score, retire_age, dep
   # Dependents reduce risk capacity
   dep <- ifelse(dependents >= 3, -2, ifelse(dependents >= 1, -1, 0))
   t   <- a + i + o + h + risk_score + dep
-  if (t >= 20) "Aggressive" else if (t >= 13) "Moderate" else "Conservative"
+  if (t >= 17) "Aggressive" else if (t >= 11) "Moderate" else "Conservative"
 }
 
 compute_retirement <- function(age, retire_age, bal_401k, bal_ira, bal_brokerage,
@@ -218,22 +218,28 @@ optimize_portfolio <- function(tickers, objective="Max Sharpe", max_weight=0.3) 
   tickers <- tickers[valid]; prices <- prices[valid]
   if (length(tickers) < 2) return(NULL)
 
+  # ── Compute betas ONCE; reuse for CAPM mu and display ──────────────────
+  # Previously this data-join was done twice (for mu + for betas display),
+  # doubling the most expensive part of the function.
+  spy     <- safe_tq_get("SPY", Sys.Date()-365*10, Sys.Date())
+  anchor  <- if (!is.null(spy)) spy %>% select(date) else prices[[1]] %>% select(date)
+
   pdf <- lapply(seq_along(tickers), function(i)
     prices[[i]] %>% select(date,close) %>% rename(!!tickers[i]:=close)) %>%
-    Reduce(function(a,b) inner_join(a,b,by="date"), .)
+    Reduce(function(a,b) full_join(a, b, by="date"), .)
+
+  pdf <- anchor %>% left_join(pdf, by="date") %>%
+    tidyr::fill(everything(), .direction = "downup")
 
   ret <- pdf %>% select(-date) %>%
     mutate(across(everything(),~log(.x/lag(.x)))) %>% na.omit()
 
   n   <- ncol(ret)
-  Sg  <- cov(ret) * 252
+  # Covariance matrix shrinkage to avoid overestimating extreme volatility
+  Sg  <- as.matrix(corpcor::cov.shrink(ret, verbose=FALSE)) * 252
   rf  <- 0.03
   erp <- 0.055
 
-  # ── Compute betas ONCE; reuse for CAPM mu and display ──────────────────
-  # Previously this data-join was done twice (for mu + for betas display),
-  # doubling the most expensive part of the function.
-  spy     <- safe_tq_get("SPY", Sys.Date()-365*10, Sys.Date())
   betas   <- rep(1.0, n)
   names(betas) <- tickers
 
@@ -256,10 +262,8 @@ optimize_portfolio <- function(tickers, objective="Max Sharpe", max_weight=0.3) 
     }, numeric(1))
   }
 
-  # Historical annualized expected returns based on the 10-year lookback
-  raw_mu <- exp(colMeans(ret) * 252) - 1
-  # Cap extreme outliers (e.g., NVDA at 60%+) to prevent optimizer instability, and floor at 2%
-  mu <- pmin(pmax(raw_mu, 0.02), 0.40)
+  # Expected returns using CAPM
+  mu <- rf + betas * erp
 
   # ── Optimisation ────────────────────────────────────────────────────────
   w <- tryCatch({
@@ -268,24 +272,20 @@ optimize_portfolio <- function(tickers, objective="Max Sharpe", max_weight=0.3) 
                cbind(rep(1,n), diag(n), -diag(n)),
                c(1, rep(0,n), rep(-max_weight,n)), meq=1)$solution
     } else {
-      # Max Sharpe via Monte Carlo — 250 iterations (was 600)
-      bw <- rep(1/n, n); bs <- -Inf
-      for (k in 1:250) {
-        wr <- runif(n)
-        wr <- pmin(wr/sum(wr), max_weight)
-        wr <- wr / sum(wr)
-        sr <- (sum(wr*mu) - rf) / sqrt(t(wr) %*% Sg %*% wr)
-        if (sr > bs) { bs <- sr; bw <- wr }
-      }
-      bw
+      # Max Sharpe via quadprog (Tangency Portfolio)
+      mu_excess <- mu - rf
+      Amat <- cbind(mu_excess, diag(n), matrix(max_weight, n, n) - diag(n))
+      bvec <- c(1, rep(0, n), rep(0, n))
+      z <- solve.QP(Dmat = 2*Sg, dvec = rep(0, n), Amat = Amat, bvec = bvec, meq = 1)$solution
+      z / sum(z)
     }
   }, error=function(e) rep(1/n, n))
 
   pr <- sum(w*mu)
   pk <- sqrt(t(w) %*% Sg %*% w)[1,1]
 
-  # Efficient frontier cloud — 120 simulations (was 300)
-  ef <- do.call(rbind, lapply(1:120, function(k) {
+  # Efficient frontier cloud — 2000 simulations
+  ef <- do.call(rbind, lapply(1:2000, function(k) {
     wr <- runif(n); wr <- pmin(wr/sum(wr), max_weight); wr <- wr/sum(wr)
     data.frame(Risk   = sqrt(t(wr) %*% Sg %*% wr)[1,1] * 100,
                Return = sum(wr*mu) * 100)
